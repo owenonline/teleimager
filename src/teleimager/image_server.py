@@ -40,8 +40,7 @@ import queue
 import fractions
 from typing import Dict, Optional, Tuple, Any
 import logging_mp
-logging_mp.basic_config(level=logging_mp.INFO)
-logger_mp = logging_mp.get_logger(__name__)
+logger_mp = logging_mp.getLogger(__name__)
 
 # ========================================================
 # cam_config_server.yaml path
@@ -890,12 +889,16 @@ class BaseCamera:
         raise NotImplementedError
 
 class RealSenseCamera(BaseCamera):
-    def __init__(self, cam_topic, serial_number, img_shape, fps, 
-                 enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False):
+    def __init__(self, cam_topic, serial_number, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666,
+                 webrtc_codec=None, enable_depth=False, binocular=False, binocular_mode="color"):
         rs = self.check_pyrealsense2_install()
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
         self._serial_number = serial_number
         self._enable_depth = enable_depth
+        self._binocular = binocular
+        self._binocular_mode = binocular_mode
+        self._ir_stereo = self._binocular and self._binocular_mode == "ir"
         self._latest_depth = None
         try:
             align_to = rs.stream.color
@@ -904,20 +907,48 @@ class RealSenseCamera(BaseCamera):
             config = rs.config()
             config.enable_device(self._serial_number)
 
-            config.enable_stream(rs.stream.color, self._img_shape[1], self._img_shape[0], rs.format.bgr8, self._fps)
+            if self._ir_stereo:
+                # IR stereo: img_shape is [H, 2*W], each IR stream is [H, W]
+                ir_width = self._img_shape[1] // 2
+                ir_height = self._img_shape[0]
+                config.enable_stream(rs.stream.infrared, 1, ir_width, ir_height, rs.format.y8, self._fps)
+                config.enable_stream(rs.stream.infrared, 2, ir_width, ir_height, rs.format.y8, self._fps)
+            else:
+                config.enable_stream(rs.stream.color, self._img_shape[1], self._img_shape[0], rs.format.bgr8, self._fps)
+
             if self._enable_depth:
-                config.enable_stream(rs.stream.depth, self._img_shape[1], self._img_shape[0], rs.format.z16, self._fps)
+                depth_width = self._img_shape[1] // 2 if self._ir_stereo else self._img_shape[1]
+                config.enable_stream(rs.stream.depth, depth_width, self._img_shape[0], rs.format.z16, self._fps)
 
             profile = self.pipeline.start(config)
             self._device = profile.get_device()
             if self._device is None:
                 logger_mp.error('[RealSenseCamera] pipe_profile.get_device() is None .')
+
+            # Disable IR projector in IR stereo mode to avoid dot pattern in images
+            if self._ir_stereo and self._device is not None:
+                try:
+                    depth_sensor = self._device.first_depth_sensor()
+                    if depth_sensor.supports(rs.option.emitter_enabled):
+                        depth_sensor.set_option(rs.option.emitter_enabled, 0)
+                        logger_mp.info(f"[RealSenseCamera] IR emitter disabled for IR stereo mode on {self._serial_number}")
+                except RuntimeError as e:
+                    logger_mp.warning(f"[RealSenseCamera] Could not disable IR emitter (non-fatal): {e}")
+
             if self._enable_depth:
                 assert self._device is not None
                 depth_sensor = self._device.first_depth_sensor()
                 self.g_depth_scale = depth_sensor.get_depth_scale()
 
-            self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            if self._ir_stereo:
+                # Intrinsics not needed for VR stereo streaming; skip if device is busy
+                try:
+                    self.intrinsics = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile().get_intrinsics()
+                except RuntimeError as e:
+                    logger_mp.warning(f"[RealSenseCamera] Could not get IR intrinsics (non-fatal): {e}")
+                    self.intrinsics = None
+            else:
+                self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             logger_mp.info(str(self))
         except Exception as e:
             if self.pipeline:
@@ -928,9 +959,15 @@ class RealSenseCamera(BaseCamera):
             raise RuntimeError(f"[RealSenseCamera] Failed to initialize RealSense camera {self._serial_number}: {e}")
 
     def __str__(self):
+        if self._ir_stereo:
+            mode = "binocular (IR stereo)"
+        elif self._binocular:
+            mode = "binocular (color split)"
+        else:
+            mode = "monocular (color)"
         return (
             f"[RealSenseCamera: {self._cam_topic}] initialized with "
-            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS, mode='{mode}'.\n"
             f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
             f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
         )
@@ -943,22 +980,44 @@ class RealSenseCamera(BaseCamera):
             raise ImportError(
                 "pyrealsense2 not installed. Install Intel RealSense SDK and pyrealsense2 Python bindings."
             ) from e
-    
+
     def _update_frame(self):
         frames = self.pipeline.wait_for_frames()
-        aligned_frames = self.align.process(frames)
-        color_frame = aligned_frames.get_color_frame()
-        if not color_frame:
-            return None
 
-        if self._enable_depth:   
-            depth_frame = aligned_frames.get_depth_frame()
-            if depth_frame:
-                self._latest_depth = np.asanyarray(depth_frame.get_data())
-            else:
-                self._latest_depth = None
+        if self._ir_stereo:
+            # IR stereo: capture both IR sensors and concatenate side-by-side
+            ir_frame_left = frames.get_infrared_frame(1)
+            ir_frame_right = frames.get_infrared_frame(2)
+            if not ir_frame_left or not ir_frame_right:
+                return None
 
-        bgr_numpy = np.asanyarray(color_frame.get_data())
+            ir_left = np.asanyarray(ir_frame_left.get_data())
+            ir_right = np.asanyarray(ir_frame_right.get_data())
+            bgr_left = cv2.cvtColor(ir_left, cv2.COLOR_GRAY2BGR)
+            bgr_right = cv2.cvtColor(ir_right, cv2.COLOR_GRAY2BGR)
+            bgr_numpy = cv2.hconcat([bgr_left, bgr_right])
+
+            if self._enable_depth:
+                depth_frame = frames.get_depth_frame()
+                if depth_frame:
+                    self._latest_depth = np.asanyarray(depth_frame.get_data())
+                else:
+                    self._latest_depth = None
+        else:
+            # Monocular color path (unchanged)
+            aligned_frames = self.align.process(frames)
+            color_frame = aligned_frames.get_color_frame()
+            if not color_frame:
+                return None
+
+            if self._enable_depth:
+                depth_frame = aligned_frames.get_depth_frame()
+                if depth_frame:
+                    self._latest_depth = np.asanyarray(depth_frame.get_data())
+                else:
+                    self._latest_depth = None
+
+            bgr_numpy = np.asanyarray(color_frame.get_data())
 
         if self._enable_webrtc:
             self._webrtc_buffer.write(bgr_numpy)
@@ -967,7 +1026,7 @@ class RealSenseCamera(BaseCamera):
             ok, buf = cv2.imencode(".jpg", bgr_numpy)
             if ok:
                 self._zmq_buffer.write(buf.tobytes())
-        
+
         if not self._ready.is_set():
             self._ready.set()
     
@@ -1177,8 +1236,11 @@ class ImageServer:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
                     else:
+                        binocular = cam_cfg.get("binocular", False)
+                        binocular_mode = cam_cfg.get("binocular_mode", "color")
                         self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
-                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                   binocular=binocular, binocular_mode=binocular_mode)
 
                 elif cam_type == "uvc":
                     uid = None
