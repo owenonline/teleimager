@@ -901,7 +901,8 @@ class BaseCamera:
 class RealSenseCamera(BaseCamera):
     def __init__(self, cam_topic, serial_number, img_shape, fps,
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666,
-                 webrtc_codec=None, enable_depth=False, binocular=False, binocular_mode="color"):
+                 webrtc_codec=None, enable_depth=False, binocular=False, binocular_mode="color",
+                 color_aux_zmq_port=None):
         rs = self.check_pyrealsense2_install()
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
         self._serial_number = serial_number
@@ -910,6 +911,11 @@ class RealSenseCamera(BaseCamera):
         self._binocular_mode = binocular_mode
         self._ir_stereo = self._binocular and self._binocular_mode == "ir"
         self._latest_depth = None
+        self._color_aux_zmq_port = color_aux_zmq_port
+        if self._color_aux_zmq_port is not None:
+            self._color_aux_zmq_buffer = TripleRingBuffer()
+        else:
+            self._color_aux_zmq_buffer = None
         try:
             align_to = rs.stream.color
             self.align = rs.align(align_to)
@@ -923,6 +929,8 @@ class RealSenseCamera(BaseCamera):
                 ir_height = self._img_shape[0]
                 config.enable_stream(rs.stream.infrared, 1, ir_width, ir_height, rs.format.y8, self._fps)
                 config.enable_stream(rs.stream.infrared, 2, ir_width, ir_height, rs.format.y8, self._fps)
+                if self._color_aux_zmq_port is not None:
+                    config.enable_stream(rs.stream.color, ir_width, ir_height, rs.format.bgr8, self._fps)
             else:
                 config.enable_stream(rs.stream.color, self._img_shape[1], self._img_shape[0], rs.format.bgr8, self._fps)
 
@@ -995,7 +1003,6 @@ class RealSenseCamera(BaseCamera):
         frames = self.pipeline.wait_for_frames()
 
         if self._ir_stereo:
-            # IR stereo: capture both IR sensors and concatenate side-by-side
             ir_frame_left = frames.get_infrared_frame(1)
             ir_frame_right = frames.get_infrared_frame(2)
             if not ir_frame_left or not ir_frame_right:
@@ -1006,6 +1013,14 @@ class RealSenseCamera(BaseCamera):
             bgr_left = cv2.cvtColor(ir_left, cv2.COLOR_GRAY2BGR)
             bgr_right = cv2.cvtColor(ir_right, cv2.COLOR_GRAY2BGR)
             bgr_numpy = cv2.hconcat([bgr_left, bgr_right])
+
+            if self._color_aux_zmq_buffer is not None:
+                color_frame = frames.get_color_frame()
+                if color_frame:
+                    color_bgr = np.asanyarray(color_frame.get_data())
+                    ok, buf = cv2.imencode(".jpg", color_bgr)
+                    if ok:
+                        self._color_aux_zmq_buffer.write(buf.tobytes())
 
             if self._enable_depth:
                 depth_frame = frames.get_depth_frame()
@@ -1040,6 +1055,14 @@ class RealSenseCamera(BaseCamera):
         if not self._ready.is_set():
             self._ready.set()
     
+    def get_color_aux_jpeg_bytes(self):
+        if self._color_aux_zmq_buffer is not None:
+            return self._color_aux_zmq_buffer.read()
+        return None
+
+    def get_color_aux_zmq_port(self):
+        return self._color_aux_zmq_port
+
     def get_depth_frame(self):
         if self._latest_depth is None:
             return None
@@ -1273,6 +1296,14 @@ class ImageServer:
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
         self._publisher_threads = []  # keep references for graceful join
 
+        # First pass: collect color_aux ZMQ ports keyed by serial number
+        self._color_aux_ports: dict[str, int] = {}
+        for cam_topic, cam_cfg in self._cam_config.items():
+            if cam_cfg.get("type", "").lower() == "realsense_color_aux" and cam_cfg.get("enable_zmq", False):
+                sn = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
+                if sn:
+                    self._color_aux_ports[sn] = cam_cfg.get("zmq_port")
+
         try:
             # Load cameras from self.cam_config
             for cam_topic, cam_cfg in self._cam_config.items():
@@ -1287,6 +1318,8 @@ class ImageServer:
                 cam_type = cam_cfg.get("type", "uvc").lower()
                 if self._isaacsim_enable and cam_type!="isaacsim":
                     cam_type = "isaacsim"
+                if cam_type == "realsense_color_aux":
+                    continue
                 img_shape = cam_cfg.get("image_shape", None)
                 fps = cam_cfg.get("fps", 30)
                 video_id = cam_cfg.get("video_id", "0")
@@ -1335,9 +1368,11 @@ class ImageServer:
                     else:
                         binocular = cam_cfg.get("binocular", False)
                         binocular_mode = cam_cfg.get("binocular_mode", "color")
+                        color_aux_zmq_port = self._color_aux_ports.get(serial_number)
                         self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
-                                                                   binocular=binocular, binocular_mode=binocular_mode)
+                                                                   binocular=binocular, binocular_mode=binocular_mode,
+                                                                   color_aux_zmq_port=color_aux_zmq_port)
 
                 elif cam_type == "uvc":
                     uid = None
@@ -1462,6 +1497,28 @@ class ImageServer:
             logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
             self._stop_event.set()
 
+    def _color_aux_zmq_pub(self, cam_topic: str, camera: RealSenseCamera):
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+            port = camera.get_color_aux_zmq_port()
+            logger_mp.info(f"[Image Server] color_camera aux publisher started on port {port} (from {cam_topic})")
+
+            while not self._stop_event.is_set():
+                jpeg_bytes = camera.get_color_aux_jpeg_bytes()
+                if jpeg_bytes is not None:
+                    self._zmq_publisher_manager.publish(jpeg_bytes, port)
+
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            logger_mp.error(f"[Image Server] Failed to publish color aux zmq frame from {cam_topic}: {e}")
+            self._stop_event.set()
+
     def _clean_up(self):
         self._responser.stop()
         for t in self._publisher_threads:
@@ -1523,6 +1580,11 @@ class ImageServer:
 
             if camera.enable_zmq():
                 t = threading.Thread(target=self._zmq_pub, args=(camera_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+
+            if isinstance(camera, RealSenseCamera) and camera.get_color_aux_zmq_port() is not None:
+                t = threading.Thread(target=self._color_aux_zmq_pub, args=(camera_topic, camera), daemon=True)
                 t.start()
                 self._publisher_threads.append(t)
 

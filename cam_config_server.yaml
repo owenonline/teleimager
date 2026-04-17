@@ -51,6 +51,20 @@ head_camera:
   physical_path: null
 
 # =====================================================
+# Color camera configuration (RGB from same RealSense, record-only)
+# =====================================================
+color_camera:
+  enable_zmq: true
+  zmq_port: 55558
+  enable_webrtc: false
+  webrtc_port: 60004
+  webrtc_codec: h264
+  type: realsense_color_aux
+  image_shape: [480, 640]
+  fps: 30
+  serial_number: 242222070166
+
+# =====================================================
 # Left wrist camera configuration
 # =====================================================
 left_wrist_camera:

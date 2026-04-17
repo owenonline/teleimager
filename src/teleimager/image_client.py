@@ -696,6 +696,9 @@ class ImageClient:
         if self._cam_config['head_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
 
+        if self._cam_config.get('color_camera', {}).get('enable_zmq', False):
+            self._subscriber_manager.subscribe(self._host, self._cam_config['color_camera']['zmq_port'], request_bgr=self._request_bgr)
+
         if self._cam_config['left_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
 
@@ -713,7 +716,12 @@ class ImageClient:
 
     def get_head_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
-    
+
+    def get_color_frame(self):
+        if self._cam_config.get('color_camera', {}).get('enable_zmq', False):
+            return self._subscriber_manager.subscribe(self._host, self._cam_config['color_camera']['zmq_port'], request_bgr=self._request_bgr)
+        return None
+
     def get_left_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
     
