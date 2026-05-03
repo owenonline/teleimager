@@ -1279,6 +1279,69 @@ class IsaacSimCamera(BaseCamera):
             self.multi_image_reader.close()
         self.multi_image_reader = None
         logger_mp.info(f"[IsaacSimCamera] Released {self._cam_topic}")
+
+class ZMQSubCamera(BaseCamera):
+    """Camera backend that subscribes to a local ZMQ PUB (here the ros bridge) for JPEG frames.
+
+    Use type: "zmq_sub" in cam_config_server.yaml when an external bridge
+    (e.g. a ROS node) publishes JPEG frames to a local ZMQ port.
+    teleimager-server stays ROS-free — all ROS work lives in the bridge.
+
+    Config keys:
+        zmq_sub_port:  port to subscribe to for JPEG frames (default: 55550)
+        zmq_sub_host:  host to subscribe to (default: 127.0.0.1)
+    """
+    def __init__(self, cam_topic, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 binocular=False, zmq_sub_host="127.0.0.1", zmq_sub_port=55550):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        self._binocular = binocular
+        self._zmq_sub_host = zmq_sub_host
+        self._zmq_sub_port = zmq_sub_port
+
+        self._sub_ctx = zmq.Context()
+        self._sub_sock = self._sub_ctx.socket(zmq.SUB)
+        self._sub_sock.setsockopt(zmq.RCVHWM, 1)
+        self._sub_sock.setsockopt(zmq.CONFLATE, 1)
+        self._sub_sock.setsockopt(zmq.LINGER, 0)
+        self._sub_sock.connect(f"tcp://{self._zmq_sub_host}:{self._zmq_sub_port}")
+        self._sub_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        return (
+            f"[ZMQSubCamera: {self._cam_topic}] subscribing to "
+            f"tcp://{self._zmq_sub_host}:{self._zmq_sub_port}, "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"ZMQ out: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def _update_frame(self):
+        try:
+            jpeg_bytes = self._sub_sock.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            return
+
+        if self._enable_zmq:
+            self._zmq_buffer.write(jpeg_bytes)
+
+        if self._enable_webrtc:
+            np_img = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                self._webrtc_buffer.write(bgr)
+
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def release(self):
+        self._sub_sock.close()
+        self._sub_ctx.term()
+        logger_mp.info(f"[ZMQSubCamera] Released {self._cam_topic}")
+
+
 # ========================================================
 # image server
 # ========================================================
@@ -1417,6 +1480,15 @@ class ImageServer:
                     self._cameras[cam_topic] = IsaacSimCamera(cam_topic, img_shape, fps,
                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
                                                                 image_source=image_source, binocular=binocular)
+                elif cam_type == "zmq_sub":
+                    binocular = cam_cfg.get("binocular", False)
+                    zmq_sub_host = cam_cfg.get("zmq_sub_host", "127.0.0.1")
+                    zmq_sub_port = cam_cfg.get("zmq_sub_port", 55550)
+                    self._cameras[cam_topic] = ZMQSubCamera(cam_topic, img_shape, fps,
+                                                            enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                            binocular=binocular,
+                                                            zmq_sub_host=zmq_sub_host,
+                                                            zmq_sub_port=zmq_sub_port)
                 else:
                     logger_mp.error(f"[Image Server] Unknown camera type {cam_type} for {cam_topic}, skipping...")
                     continue
