@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 # uvc will be imported when needed
 import yaml
+import zmq
 import time
 import threading
 import signal

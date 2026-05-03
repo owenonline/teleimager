@@ -21,7 +21,10 @@ head_camera:
   #   - "opencv"    → opencv driver
   #   - "realsense" → pyrealsense2 driver
   #   - "uvc"       → pyuvc driver
-  type: realsense
+  #   - "zmq_sub"   → subscribe to a local ZMQ PUB (e.g. ROS bridge on port 55550)
+  type: zmq_sub
+  zmq_sub_host: 127.0.0.1
+  zmq_sub_port: 55550
 
   # Image Format
   # image resolution: [height, width]
